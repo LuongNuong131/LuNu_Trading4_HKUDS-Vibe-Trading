@@ -1,0 +1,128 @@
+name: Build and Push Docker Image
+
+# Actions are pinned to immutable commit SHAs, matching every other workflow in
+# this repository. Newer majors exist for the docker/* actions (v4/v6/v7); those
+# are a deliberate, separately testable bump, not a drive-by change here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag (e.g., v1.0.0, latest)'
+        required: true
+        default: 'latest'
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  DOCKERHUB_REGISTRY: docker.io
+  GHCR_IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Validate image tag
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          # Fail early with a readable message rather than at the registry push.
+          if ! printf '%s' "$IMAGE_TAG" | grep -qE '^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$'; then
+            echo "::error::'$IMAGE_TAG' is not a valid Docker tag." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.DOCKERHUB_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata for GHCR
+        id: meta-ghcr
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=raw,value=latest,enable=${{ inputs.image_tag != 'latest' }}
+
+      - name: Extract metadata for Docker Hub
+        id: meta-dockerhub
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.image_tag }}
+            type=raw,value=latest,enable=${{ inputs.image_tag != 'latest' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta-ghcr.outputs.tags }}
+            ${{ steps.meta-dockerhub.outputs.tags }}
+          labels: ${{ steps.meta-ghcr.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4.0.2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE_NAME }}
+          readme-filepath: ./README.md
+          short-description: "AI trading agent with backtesting. Includes Telegram & Feishu channels."
+
+      - name: Summary
+        # Inputs go through env, never straight into the script body: a
+        # workflow_dispatch input interpolated into `run:` is a shell-injection
+        # vector even when only maintainers can dispatch it.
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GHCR_IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+          DOCKERHUB_IMAGE: ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+        run: |
+          {
+            echo "### Docker Images Built and Pushed"
+            echo ""
+            echo "**GHCR:** \`${GHCR_IMAGE}:${IMAGE_TAG}\`"
+            echo "**Docker Hub:** \`${DOCKERHUB_IMAGE}:${IMAGE_TAG}\`"
+            echo ""
+            echo "**Platforms:** linux/amd64, linux/arm64"
+            echo "**Channels:** feishu, telegram (from requirements-channels-lock.txt)"
+            echo ""
+            echo '```bash'
+            echo "docker pull ${GHCR_IMAGE}:${IMAGE_TAG}"
+            echo '```'
+            echo ""
+            echo "> A newly created GHCR package is **private by default**. Until its"
+            echo "> visibility is set to public once in the org package settings, the"
+            echo "> pull above works only for authenticated users with read access."
+          } >> "$GITHUB_STEP_SUMMARY"
